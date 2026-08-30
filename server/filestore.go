@@ -217,6 +217,10 @@ type fileStore struct {
 	sdm         *SDMMeta
 	lpex        time.Time // Last PurgeEx call.
 	dios        *diskIOSemaphore
+	// atomicBatchSync defers SyncAlways flushes while an R1 atomic publish is
+	// committed. The stream isolation lock hides intermediate state, and the
+	// final PubAck is sent only after endAtomicSyncBatch flushes the commit.
+	atomicBatchSync bool
 }
 
 // Represents a message store block and its data.
@@ -5558,6 +5562,38 @@ func (fs *fileStore) FlushAllPending() error {
 	return fs.checkAndFlushLastBlock()
 }
 
+// beginAtomicSyncBatch starts a short durability section for an R1 atomic
+// publish. Regular stores retain their existing asynchronous flush behavior.
+func (fs *fileStore) beginAtomicSyncBatch() (bool, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if !fs.syncAlways.Load() {
+		return false, nil
+	}
+	if fs.atomicBatchSync {
+		return false, errors.New("atomic sync batch already active")
+	}
+	fs.atomicBatchSync = true
+	return true, nil
+}
+
+// endAtomicSyncBatch makes the complete atomic commit durable before its final
+// PubAck can be emitted.
+func (fs *fileStore) endAtomicSyncBatch() error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if !fs.atomicBatchSync {
+		return nil
+	}
+	fs.atomicBatchSync = false
+	if fs.werr != nil {
+		return fs.werr
+	}
+	return fs.checkAndFlushLastBlock()
+}
+
 // Lock should be held.
 func (fs *fileStore) rebuildFirst() error {
 	if len(fs.blks) == 0 {
@@ -7731,7 +7767,7 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	fs.dirty++
 
 	// Ask msg block to store in write through cache.
-	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip)
+	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip && !fs.atomicBatchSync)
 
 	return rl, err
 }
@@ -10304,7 +10340,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 			}
 		}
 		// Flush any pending. If we change blocks the newMsgBlockForWrite() will flush any pending for us.
-		if lmb := fs.lmb; lmb != nil {
+		if lmb := fs.lmb; lmb != nil && !fs.atomicBatchSync {
 			if err = lmb.flushPendingMsgs(); err != nil {
 				fs.mu.Unlock()
 				return purged, err
