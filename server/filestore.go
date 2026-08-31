@@ -218,9 +218,11 @@ type fileStore struct {
 	lpex        time.Time // Last PurgeEx call.
 	dios        *diskIOSemaphore
 	// atomicBatchSync defers SyncAlways flushes while an R1 atomic publish is
-	// committed. The stream isolation lock hides intermediate state, and the
-	// final PubAck is sent only after endAtomicSyncBatch flushes the commit.
-	atomicBatchSync bool
+	// committed. atomicBatchMu protects the exact set of blocks dirtied in that
+	// section so the final flush does not scan the whole stream.
+	atomicBatchMu    sync.Mutex
+	atomicBatchSync  atomic.Bool
+	atomicBatchDirty map[*msgBlock]struct{}
 }
 
 // Represents a message store block and its data.
@@ -5571,27 +5573,105 @@ func (fs *fileStore) beginAtomicSyncBatch() (bool, error) {
 	if !fs.syncAlways.Load() {
 		return false, nil
 	}
-	if fs.atomicBatchSync {
+	fs.atomicBatchMu.Lock()
+	defer fs.atomicBatchMu.Unlock()
+	if fs.atomicBatchSync.Load() {
 		return false, errors.New("atomic sync batch already active")
 	}
-	fs.atomicBatchSync = true
+	fs.atomicBatchDirty = make(map[*msgBlock]struct{})
+	fs.atomicBatchSync.Store(true)
 	return true, nil
 }
 
-// endAtomicSyncBatch makes the complete atomic commit durable before its final
-// PubAck can be emitted.
+// endAtomicSyncBatch makes only the blocks touched by the complete atomic
+// commit durable before its final PubAck can be emitted.
 func (fs *fileStore) endAtomicSyncBatch() error {
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	if !fs.atomicBatchSync {
+	fs.atomicBatchMu.Lock()
+	if !fs.atomicBatchSync.Load() {
+		fs.atomicBatchMu.Unlock()
+		fs.mu.Unlock()
 		return nil
 	}
-	fs.atomicBatchSync = false
-	if fs.werr != nil {
-		return fs.werr
+	dirty := make([]*msgBlock, 0, len(fs.atomicBatchDirty))
+	for mb := range fs.atomicBatchDirty {
+		dirty = append(dirty, mb)
 	}
-	return fs.checkAndFlushLastBlock()
+	fs.atomicBatchDirty = nil
+	fs.atomicBatchSync.Store(false)
+	fs.atomicBatchMu.Unlock()
+	err := fs.werr
+	fs.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return fs.syncAtomicBatchBlocks(dirty)
+}
+
+func (fs *fileStore) trackAtomicBatchBlock(mb *msgBlock) {
+	if mb == nil || !fs.atomicBatchSync.Load() {
+		return
+	}
+	fs.atomicBatchMu.Lock()
+	if fs.atomicBatchSync.Load() {
+		fs.atomicBatchDirty[mb] = struct{}{}
+	}
+	fs.atomicBatchMu.Unlock()
+}
+
+// markNeedsSyncLocked records a block for the batch durability flush when one
+// is active. The caller must hold the block lock.
+func (mb *msgBlock) markNeedsSyncLocked() {
+	mb.needSync = true
+	mb.fs.trackAtomicBatchBlock(mb)
+}
+
+func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) error {
+	storeWriteErr := func(err error) error {
+		fs.mu.Lock()
+		fs.setWriteErr(err)
+		fs.mu.Unlock()
+		return err
+	}
+
+	for _, mb := range blks {
+		mb.mu.Lock()
+		if mb.closed {
+			mb.mu.Unlock()
+			continue
+		}
+		if err := mb.werr; err != nil {
+			mb.mu.Unlock()
+			return storeWriteErr(err)
+		}
+		hadPending := mb.pendingWriteSizeLocked() > 0
+		if _, err := mb.flushPendingMsgsLocked(); err != nil {
+			mb.mu.Unlock()
+			return storeWriteErr(err)
+		}
+		if mb.needKeySync && mb.kfn != _EMPTY_ {
+			if err := fs.syncFileAndDir(mb.kfn); err != nil {
+				mb.mu.Unlock()
+				return storeWriteErr(err)
+			}
+			mb.needKeySync = false
+		}
+		// SyncAlways flushes pending bytes inline. Async mode still needs an
+		// unconditional sync: the background timer may have claimed needSync
+		// without completing its fsync yet.
+		if !mb.syncAlways || mb.needSync && !hadPending {
+			if err := mb.syncFile(); err != nil {
+				mb.mu.Unlock()
+				return storeWriteErr(err)
+			}
+		}
+		mb.needSync = false
+		mb.mu.Unlock()
+	}
+
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return fs.werr
 }
 
 // Lock should be held.
@@ -7767,7 +7847,10 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	fs.dirty++
 
 	// Ask msg block to store in write through cache.
-	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip && !fs.atomicBatchSync)
+	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip && !fs.atomicBatchSync.Load())
+	if err == nil {
+		fs.trackAtomicBatchBlock(mb)
+	}
 
 	return rl, err
 }
@@ -7792,7 +7875,11 @@ func (fs *fileStore) writeTombstoneNoFlush(seq uint64, ts int64) error {
 		return err
 	}
 	// Write tombstone without flush or kick.
-	return lmb.writeTombstoneNoFlush(seq, ts)
+	if err := lmb.writeTombstoneNoFlush(seq, ts); err != nil {
+		return err
+	}
+	fs.trackAtomicBatchBlock(lmb)
+	return nil
 }
 
 // Lock should be held.
@@ -10340,7 +10427,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 			}
 		}
 		// Flush any pending. If we change blocks the newMsgBlockForWrite() will flush any pending for us.
-		if lmb := fs.lmb; lmb != nil && !fs.atomicBatchSync {
+		if lmb := fs.lmb; lmb != nil && !fs.atomicBatchSync.Load() {
 			if err = lmb.flushPendingMsgs(); err != nil {
 				fs.mu.Unlock()
 				return purged, err
@@ -10725,7 +10812,7 @@ func (fs *fileStore) compactLocked(seq uint64) (purged, bytes uint64, err error)
 			deleted++
 		} else {
 			// Make sure to sync changes.
-			smb.needSync = true
+			smb.markNeedsSyncLocked()
 		}
 		// Update fs first here as well.
 		fs.state.FirstSeq = atomic.LoadUint64(&smb.last.seq) + 1
@@ -10733,7 +10820,7 @@ func (fs *fileStore) compactLocked(seq uint64) (purged, bytes uint64, err error)
 
 	} else {
 		// Make sure to sync changes.
-		smb.needSync = true
+		smb.markNeedsSyncLocked()
 		// Just for start condition for selectNextFirst.
 		if smb.first.seq < seq {
 			atomic.StoreUint64(&smb.first.seq, seq-1)
