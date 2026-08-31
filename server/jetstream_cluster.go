@@ -5247,6 +5247,12 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		}
 
 		if !alreadyRunning && numReplicas > 1 {
+			// Serialize the R1-to-Raft authority handoff with standalone atomic
+			// commits. A commit that entered first finishes before the initial
+			// snapshot; one that enters later observes the node and proposes to it.
+			if needsNode {
+				mset.isolateMu.Lock()
+			}
 			if needsNode {
 				// Must run before startClusterSubs reads mset.sa.Sync.
 				mset.setStreamAssignment(sa)
@@ -5262,6 +5268,10 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 					"account": mset.accName(),
 					"stream":  mset.name(),
 				})
+
+				// Re-link the assignment so mset.node picks up the newly created
+				// node before releasing the isolation boundary.
+				mset.setStreamAssignment(sa)
 			}
 			mset.startMonitorWg()
 			// Start monitoring..
@@ -5275,6 +5285,9 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			)
 			if !started {
 				mset.monitorWg.Done()
+			}
+			if needsNode {
+				mset.isolateMu.Unlock()
 			}
 		} else if numReplicas == 1 && alreadyRunning {
 			// We downgraded to R1. Make sure we cleanup the raft node and the stream monitor.
