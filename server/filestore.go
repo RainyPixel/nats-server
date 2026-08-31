@@ -5626,13 +5626,14 @@ func (mb *msgBlock) markNeedsSyncLocked() {
 	mb.fs.trackAtomicBatchBlock(mb)
 }
 
-func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) error {
-	storeWriteErr := func(err error) error {
-		fs.mu.Lock()
-		fs.setWriteErr(err)
-		fs.mu.Unlock()
-		return err
-	}
+func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) (err error) {
+	defer func() {
+		if err != nil {
+			fs.mu.Lock()
+			fs.setWriteErr(err)
+			fs.mu.Unlock()
+		}
+	}()
 
 	for _, mb := range blks {
 		mb.mu.Lock()
@@ -5640,19 +5641,19 @@ func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) error {
 			mb.mu.Unlock()
 			continue
 		}
-		if err := mb.werr; err != nil {
+		if err = mb.werr; err != nil {
 			mb.mu.Unlock()
-			return storeWriteErr(err)
+			return err
 		}
 		hadPending := mb.pendingWriteSizeLocked() > 0
-		if _, err := mb.flushPendingMsgsLocked(); err != nil {
+		if _, err = mb.flushPendingMsgsLocked(); err != nil {
 			mb.mu.Unlock()
-			return storeWriteErr(err)
+			return err
 		}
 		if mb.needKeySync && mb.kfn != _EMPTY_ {
-			if err := fs.syncFileAndDir(mb.kfn); err != nil {
+			if err = fs.syncFileAndDir(mb.kfn); err != nil {
 				mb.mu.Unlock()
-				return storeWriteErr(err)
+				return err
 			}
 			mb.needKeySync = false
 		}
@@ -5660,9 +5661,9 @@ func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) error {
 		// unconditional sync: the background timer may have claimed needSync
 		// without completing its fsync yet.
 		if !mb.syncAlways || mb.needSync && !hadPending {
-			if err := mb.syncFile(); err != nil {
+			if err = mb.syncFile(); err != nil {
 				mb.mu.Unlock()
-				return storeWriteErr(err)
+				return err
 			}
 		}
 		mb.needSync = false
@@ -5670,8 +5671,9 @@ func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) error {
 	}
 
 	fs.mu.RLock()
-	defer fs.mu.RUnlock()
-	return fs.werr
+	err = fs.werr
+	fs.mu.RUnlock()
+	return err
 }
 
 // Lock should be held.
