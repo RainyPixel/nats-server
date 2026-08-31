@@ -15501,6 +15501,64 @@ func TestFileStoreAtomicSyncBatchHonorsConcurrentPersistModeUpdate(t *testing.T)
 	require_False(t, needsSync)
 }
 
+func TestFileStoreAtomicSyncBatchSyncsBlocksInOrder(t *testing.T) {
+	sd := t.TempDir()
+	fcfg := FileStoreConfig{
+		StoreDir:     sd,
+		BlockSize:    128,
+		SyncInterval: time.Hour,
+		SyncAlways:   true,
+	}
+	cfg := StreamConfig{Name: "TEST", Subjects: []string{"state.*"}, Storage: FileStorage}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	payload := make([]byte, 96)
+	for i := 0; len(fs.blks) < 2; i++ {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("state.batch.%d", i), nil, payload, 0)
+		require_NoError(t, err)
+	}
+	earlier, commit := fs.blks[len(fs.blks)-2], fs.blks[len(fs.blks)-1]
+	writeErr := errors.New("earlier block sync failed")
+	earlier.mu.Lock()
+	earlier.werr = writeErr
+	earlier.mu.Unlock()
+	commit.mu.Lock()
+	commit.needSync = true
+	commit.mu.Unlock()
+
+	err = fs.syncAtomicBatchBlocks([]*msgBlock{commit, earlier})
+	require_Error(t, err, writeErr)
+	commit.mu.RLock()
+	commitNeedsSync := commit.needSync
+	commit.mu.RUnlock()
+	require_True(t, commitNeedsSync)
+
+	earlier.mu.Lock()
+	earlier.werr = nil
+	earlier.mu.Unlock()
+	fs.mu.Lock()
+	fs.werr = nil
+	fs.mu.Unlock()
+}
+
+func TestFileStoreAtomicSyncBatchFailsWhenStoreCloses(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), SyncAlways: true}
+	cfg := StreamConfig{Name: "TEST", Subjects: []string{"state.*"}, Storage: FileStorage}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	fs.mu.Lock()
+	fs.closing = true
+	fs.mu.Unlock()
+	require_Error(t, fs.syncAtomicBatchBlocks(nil), ErrStoreClosed)
+	fs.mu.Lock()
+	fs.closing = false
+	fs.mu.Unlock()
+}
+
 func Benchmark_FileStoreDeleteMap(b *testing.B) {
 	msg := []byte("hello")
 	// Many small blocks with mostly interior deletes, the shape a stream

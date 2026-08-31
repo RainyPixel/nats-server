@@ -5627,6 +5627,12 @@ func (mb *msgBlock) markNeedsSyncLocked() {
 }
 
 func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) (err error) {
+	// The block containing the commit marker must reach disk after all earlier
+	// blocks, otherwise recovery can observe a durable commit with missing data.
+	slices.SortFunc(blks, func(a, b *msgBlock) int {
+		return cmp.Compare(a.index, b.index)
+	})
+
 	defer func() {
 		if err != nil {
 			fs.mu.Lock()
@@ -5671,7 +5677,11 @@ func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) (err error) {
 	}
 
 	fs.mu.RLock()
-	err = fs.werr
+	if fs.closing || fs.closed.Load() {
+		err = ErrStoreClosed
+	} else {
+		err = fs.werr
+	}
 	fs.mu.RUnlock()
 	return err
 }
