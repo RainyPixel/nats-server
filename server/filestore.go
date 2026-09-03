@@ -68,6 +68,8 @@ type FileStoreConfig struct {
 	SyncInterval time.Duration
 	// SyncAlways is when the stream should sync all data writes.
 	SyncAlways bool
+	// SyncOnFlush relaxes SyncAlways to flush writes on FlushAllPending.
+	SyncOnFlush bool
 	// AsyncFlush allows async flush to batch write operations.
 	AsyncFlush bool
 	// Cipher is the cipher to use when encrypting.
@@ -185,9 +187,11 @@ type fileStore struct {
 	ageChkRun   bool        // Whether message expiration is currently running.
 	ageChkTime  int64       // When the message expiration is scheduled to run.
 	syncTmr     *time.Timer
+	syncMu      sync.Mutex // Serializes background and explicit block syncs.
 	cfg         FileStreamInfo
 	fcfg        FileStoreConfig
-	syncAlways  atomic.Bool // Mirrors FileStoreConfig.SyncAlways for lock-free reads from writeFileWithOptionalSync.
+	syncAlways  atomic.Bool // Effective SyncAlways behavior for lock-free reads.
+	syncOnFlush atomic.Bool // Effective sync-on-flush behavior.
 	prf         keyGen
 	oldprf      keyGen
 	aek         cipher.AEAD
@@ -217,12 +221,6 @@ type fileStore struct {
 	sdm         *SDMMeta
 	lpex        time.Time // Last PurgeEx call.
 	dios        *diskIOSemaphore
-	// atomicBatchSync defers SyncAlways flushes while an R1 atomic publish is
-	// committed. atomicBatchMu protects the exact set of blocks dirtied in that
-	// section so the final flush does not scan the whole stream.
-	atomicBatchMu    sync.Mutex
-	atomicBatchSync  atomic.Bool
-	atomicBatchDirty map[*msgBlock]struct{}
 }
 
 // Represents a message store block and its data.
@@ -269,7 +267,6 @@ type msgBlock struct {
 	noTrack     bool
 	needSync    bool
 	needKeySync bool // Key file is written once and immutable, cleared after its one sync.
-	syncAlways  bool
 	noCompact   bool
 	closed      bool
 	ttls        uint64 // How many msgs have TTLs?
@@ -455,7 +452,8 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		fsld:   make(chan struct{}),
 		srv:    fcfg.srv,
 	}
-	fs.syncAlways.Store(fcfg.SyncAlways)
+	fs.syncAlways.Store(fcfg.SyncAlways && !fcfg.SyncOnFlush)
+	fs.syncOnFlush.Store(fcfg.SyncOnFlush)
 
 	// Register with access time service.
 	ats.Register()
@@ -689,6 +687,29 @@ func (fs *fileStore) setCreatedTime(created time.Time) {
 	fs.mu.Unlock()
 }
 
+func (fs *fileStore) updateDurabilitySettingsLocked(syncOnFlush bool) {
+	if !fs.fcfg.SyncAlways {
+		fs.syncAlways.Store(false)
+		fs.syncOnFlush.Store(false)
+		return
+	}
+	// Enable the new mode before disabling the old one so writes are never
+	// processed with both durability modes disabled.
+	if syncOnFlush {
+		fs.syncOnFlush.Store(true)
+		fs.syncAlways.Store(false)
+	} else {
+		fs.syncAlways.Store(true)
+		fs.syncOnFlush.Store(false)
+	}
+}
+
+// v2.14 does not relax replicated stream durability to the Raft WAL, so the
+// configured mode always resets to SyncAlways after a bounded atomic commit.
+func (fs *fileStore) resetDurabilitySettingsLocked() {
+	fs.updateDurabilitySettingsLocked(false)
+}
+
 func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 	start := time.Now()
 	defer func() {
@@ -782,9 +803,7 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 			supportsAsyncFlush = true
 			fs.fcfg.SyncAlways = false
 			fs.syncAlways.Store(false)
-			lmb.mu.Lock()
-			lmb.syncAlways = false
-			lmb.mu.Unlock()
+			fs.syncOnFlush.Store(false)
 		}
 
 		if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
@@ -1135,12 +1154,11 @@ func (fs *fileStore) noTrackSubjects() bool {
 // Will init the basics for a message block.
 func (fs *fileStore) initMsgBlock(index uint32) *msgBlock {
 	mb := &msgBlock{
-		fs:         fs,
-		index:      index,
-		cexp:       fs.fcfg.CacheExpire,
-		fexp:       fs.fcfg.SubjectStateExpire,
-		noTrack:    fs.noTrackSubjects(),
-		syncAlways: fs.fcfg.SyncAlways,
+		fs:      fs,
+		index:   index,
+		cexp:    fs.fcfg.CacheExpire,
+		fexp:    fs.fcfg.SubjectStateExpire,
+		noTrack: fs.noTrackSubjects(),
 	}
 
 	mdir := filepath.Join(fs.fcfg.StoreDir, msgDir)
@@ -5056,7 +5074,7 @@ func (fs *fileStore) genEncryptionKeysForBlock(mb *msgBlock) error {
 	if _, err := os.Stat(keyFile); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	sync := fs.syncAlways.Load()
+	sync := fs.syncAlways.Load() || fs.syncOnFlush.Load()
 	err = writeAtomically(fs.dios, keyFile, encrypted, defaultFilePerms, sync)
 	if err != nil {
 		return err
@@ -5561,129 +5579,13 @@ func (fs *fileStore) FlushAllPending() error {
 	if fs.werr != nil {
 		return fs.werr
 	}
-	return fs.checkAndFlushLastBlock()
-}
-
-// beginAtomicSyncBatch starts a short durability section for an R1 atomic
-// publish. Regular stores retain their existing asynchronous flush behavior.
-func (fs *fileStore) beginAtomicSyncBatch() (bool, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	if !fs.syncAlways.Load() {
-		return false, nil
-	}
-	fs.atomicBatchMu.Lock()
-	defer fs.atomicBatchMu.Unlock()
-	if fs.atomicBatchSync.Load() {
-		return false, errors.New("atomic sync batch already active")
-	}
-	fs.atomicBatchDirty = make(map[*msgBlock]struct{})
-	fs.atomicBatchSync.Store(true)
-	return true, nil
-}
-
-// endAtomicSyncBatch makes only the blocks touched by the complete atomic
-// commit durable before its final PubAck can be emitted.
-func (fs *fileStore) endAtomicSyncBatch() error {
-	fs.mu.Lock()
-	fs.atomicBatchMu.Lock()
-	if !fs.atomicBatchSync.Load() {
-		fs.atomicBatchMu.Unlock()
+	if fs.syncOnFlush.Load() {
 		fs.mu.Unlock()
-		return nil
+		fs.syncBlocks()
+		fs.mu.Lock()
+		return fs.werr
 	}
-	dirty := make([]*msgBlock, 0, len(fs.atomicBatchDirty))
-	for mb := range fs.atomicBatchDirty {
-		dirty = append(dirty, mb)
-	}
-	fs.atomicBatchDirty = nil
-	fs.atomicBatchSync.Store(false)
-	fs.atomicBatchMu.Unlock()
-	err := fs.werr
-	fs.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	return fs.syncAtomicBatchBlocks(dirty)
-}
-
-func (fs *fileStore) trackAtomicBatchBlock(mb *msgBlock) {
-	if mb == nil || !fs.atomicBatchSync.Load() {
-		return
-	}
-	fs.atomicBatchMu.Lock()
-	if fs.atomicBatchSync.Load() {
-		fs.atomicBatchDirty[mb] = struct{}{}
-	}
-	fs.atomicBatchMu.Unlock()
-}
-
-// markNeedsSyncLocked records a block for the batch durability flush when one
-// is active. The caller must hold the block lock.
-func (mb *msgBlock) markNeedsSyncLocked() {
-	mb.needSync = true
-	mb.fs.trackAtomicBatchBlock(mb)
-}
-
-func (fs *fileStore) syncAtomicBatchBlocks(blks []*msgBlock) (err error) {
-	// The block containing the commit marker must reach disk after all earlier
-	// blocks, otherwise recovery can observe a durable commit with missing data.
-	slices.SortFunc(blks, func(a, b *msgBlock) int {
-		return cmp.Compare(a.index, b.index)
-	})
-
-	defer func() {
-		if err != nil {
-			fs.mu.Lock()
-			fs.setWriteErr(err)
-			fs.mu.Unlock()
-		}
-	}()
-
-	for _, mb := range blks {
-		mb.mu.Lock()
-		if mb.closed {
-			mb.mu.Unlock()
-			continue
-		}
-		if err = mb.werr; err != nil {
-			mb.mu.Unlock()
-			return err
-		}
-		hadPending := mb.pendingWriteSizeLocked() > 0
-		if _, err = mb.flushPendingMsgsLocked(); err != nil {
-			mb.mu.Unlock()
-			return err
-		}
-		if mb.needKeySync && mb.kfn != _EMPTY_ {
-			if err = fs.syncFileAndDir(mb.kfn); err != nil {
-				mb.mu.Unlock()
-				return err
-			}
-			mb.needKeySync = false
-		}
-		// SyncAlways flushes pending bytes inline. Async mode still needs an
-		// unconditional sync: the background timer may have claimed needSync
-		// without completing its fsync yet.
-		if !mb.syncAlways || mb.needSync && !hadPending {
-			if err = mb.syncFile(); err != nil {
-				mb.mu.Unlock()
-				return err
-			}
-		}
-		mb.needSync = false
-		mb.mu.Unlock()
-	}
-
-	fs.mu.RLock()
-	if fs.closing || fs.closed.Load() {
-		err = ErrStoreClosed
-	} else {
-		err = fs.werr
-	}
-	fs.mu.RUnlock()
-	return err
+	return fs.checkAndFlushLastBlock()
 }
 
 // Lock should be held.
@@ -6509,7 +6411,7 @@ func (mb *msgBlock) compactWithFloor(floor uint64, fsDmap *interiorDeletes) erro
 
 	// We will write to a new file and mv/rename it in case of failure.
 	mfn := filepath.Join(mb.fs.fcfg.StoreDir, msgDir, fmt.Sprintf(newScan, mb.index))
-	sync := mb.syncAlways
+	sync := mb.fs.syncAlways.Load() || mb.fs.syncOnFlush.Load()
 	if err := writeAtomicallyWithTemp(mb.fs.dios, mfn, mb.mfn, nbuf, defaultFilePerms, sync); err != nil {
 		return err
 	}
@@ -7859,10 +7761,7 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	fs.dirty++
 
 	// Ask msg block to store in write through cache.
-	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip && !fs.atomicBatchSync.Load())
-	if err == nil {
-		fs.trackAtomicBatchBlock(mb)
-	}
+	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip)
 
 	return rl, err
 }
@@ -7890,7 +7789,6 @@ func (fs *fileStore) writeTombstoneNoFlush(seq uint64, ts int64) error {
 	if err := lmb.writeTombstoneNoFlush(seq, ts); err != nil {
 		return err
 	}
-	fs.trackAtomicBatchBlock(lmb)
 	return nil
 }
 
@@ -8118,6 +8016,9 @@ func (mb *msgBlock) syncFile() error {
 
 // Sync msg and index files as needed. This is called from a timer.
 func (fs *fileStore) syncBlocks() {
+	fs.syncMu.Lock()
+	defer fs.syncMu.Unlock()
+
 	if fs.isClosed() {
 		return
 	}
@@ -8279,7 +8180,7 @@ func (fs *fileStore) syncBlocks() {
 	}
 
 	// Sync state file if we are not running with sync always.
-	if !fs.fcfg.SyncAlways {
+	if !fs.syncAlways.Load() {
 		fn := filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)
 		var fd *os.File
 		var err error
@@ -8680,7 +8581,7 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	mb.cache.wp = int(wp)
 
 	// Check if we are in sync always mode.
-	if mb.syncAlways {
+	if mb.fs.syncAlways.Load() {
 		if err = mb.mfd.Sync(); err != nil {
 			mb.werr = err
 			assert.Unreachable("Filestore msg block encountered sync error", map[string]any{
@@ -10439,7 +10340,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 			}
 		}
 		// Flush any pending. If we change blocks the newMsgBlockForWrite() will flush any pending for us.
-		if lmb := fs.lmb; lmb != nil && !fs.atomicBatchSync.Load() {
+		if lmb := fs.lmb; lmb != nil {
 			if err = lmb.flushPendingMsgs(); err != nil {
 				fs.mu.Unlock()
 				return purged, err
@@ -10824,7 +10725,7 @@ func (fs *fileStore) compactLocked(seq uint64) (purged, bytes uint64, err error)
 			deleted++
 		} else {
 			// Make sure to sync changes.
-			smb.markNeedsSyncLocked()
+			smb.needSync = true
 		}
 		// Update fs first here as well.
 		fs.state.FirstSeq = atomic.LoadUint64(&smb.last.seq) + 1
@@ -10832,7 +10733,7 @@ func (fs *fileStore) compactLocked(seq uint64) (purged, bytes uint64, err error)
 
 	} else {
 		// Make sure to sync changes.
-		smb.markNeedsSyncLocked()
+		smb.needSync = true
 		// Just for start condition for selectNextFirst.
 		if smb.first.seq < seq {
 			atomic.StoreUint64(&smb.first.seq, seq-1)
@@ -14213,7 +14114,8 @@ func (alg StoreCompression) Decompress(buf []byte) ([]byte, error) {
 // sets O_SYNC on the open file if SyncAlways is set. The dios semaphore is
 // handled automatically by this function, so don't wrap calls to it in dios.
 func (fs *fileStore) writeFileWithOptionalSync(name string, data []byte, perm fs.FileMode) error {
-	return writeAtomically(fs.dios, name, data, perm, fs.syncAlways.Load())
+	sync := fs.syncAlways.Load() || fs.syncOnFlush.Load()
+	return writeAtomically(fs.dios, name, data, perm, sync)
 }
 
 func writeFileWithSync(dios *diskIOSemaphore, name string, data []byte, perm fs.FileMode) error {
