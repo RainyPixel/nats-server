@@ -13355,22 +13355,24 @@ func deleteBlockContentsEqual(a, b DeleteBlock) bool {
 ////////////////////////////////////////////////////////////////////////////////
 
 type consumerFileStore struct {
-	mu      sync.Mutex
-	fs      *fileStore
-	cfg     *FileConsumerInfo
-	prf     keyGen
-	aek     cipher.AEAD
-	name    string
-	odir    string
-	ifn     string
-	hh      *highwayhash.Digest64
-	state   ConsumerState
-	fch     chan struct{}
-	qch     chan struct{}
-	flusher bool
-	writing bool
-	dirty   bool
-	closed  bool
+	// Acquire the writer lock before mu, including when capturing a snapshot.
+	wmu         sync.Mutex
+	mu          sync.Mutex
+	fs          *fileStore
+	cfg         *FileConsumerInfo
+	prf         keyGen
+	aek         cipher.AEAD
+	name        string
+	odir        string
+	ifn         string
+	hh          *highwayhash.Digest64
+	state       ConsumerState
+	stateLoaded bool
+	fch         chan struct{}
+	qch         chan struct{}
+	flusher     bool
+	dirty       bool
+	closed      bool
 }
 
 func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *ConsumerConfig) (ConsumerStore, error) {
@@ -13635,20 +13637,24 @@ func (o *consumerFileStore) flushLoop(fch, qch chan struct{}) {
 					return
 				}
 			}
+			o.wmu.Lock()
 			o.mu.Lock()
 			if o.closed {
 				o.mu.Unlock()
+				o.wmu.Unlock()
 				return
 			}
 			buf, err := o.encodeState()
 			o.mu.Unlock()
 			if err != nil {
+				o.wmu.Unlock()
 				return
 			}
 			// TODO(dlc) - if we error should start failing upwards.
-			if err := o.writeState(buf); err == nil {
+			if err := o.writeStateLocked(buf); err == nil {
 				lastWrite = time.Now()
 			}
+			o.wmu.Unlock()
 		case <-qch:
 			return
 		}
@@ -13657,12 +13663,19 @@ func (o *consumerFileStore) flushLoop(fch, qch chan struct{}) {
 
 // SetStarting sets our starting stream sequence.
 func (o *consumerFileStore) SetStarting(sseq uint64) error {
+	o.wmu.Lock()
+	defer o.wmu.Unlock()
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return ErrStoreClosed
+	}
 	o.state.Delivered.Stream = sseq
 	o.state.AckFloor.Stream = sseq
+	o.stateLoaded = true
 	buf := encodeConsumerState(&o.state)
 	o.mu.Unlock()
-	return o.writeState(buf)
+	return o.writeStateLocked(buf)
 }
 
 // UpdateStarting updates our starting stream sequence.
@@ -13677,16 +13690,28 @@ func (o *consumerFileStore) UpdateStarting(sseq uint64) {
 			o.state.AckFloor.Stream = sseq
 		}
 	}
+	o.stateLoaded = true
 	// Make sure we flush to disk.
 	o.kickFlusher()
 }
 
 // Reset all values in the store, and reset the starting sequence.
 func (o *consumerFileStore) Reset(sseq uint64) error {
+	o.wmu.Lock()
+	defer o.wmu.Unlock()
 	o.mu.Lock()
-	o.state = ConsumerState{}
+	if o.closed {
+		o.mu.Unlock()
+		return ErrStoreClosed
+	}
+	o.state = ConsumerState{
+		Delivered: SequencePair{Stream: sseq},
+		AckFloor:  SequencePair{Stream: sseq},
+	}
+	o.stateLoaded = true
+	buf := encodeConsumerState(&o.state)
 	o.mu.Unlock()
-	return o.SetStarting(sseq)
+	return o.writeStateLocked(buf)
 }
 
 // HasState returns if this store has a recorded state.
@@ -13765,6 +13790,7 @@ func (o *consumerFileStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) err
 			o.state.AckFloor.Stream = sseq
 		}
 	}
+	o.stateLoaded = true
 	// Make sure we flush to disk.
 	o.kickFlusher()
 
@@ -13955,6 +13981,7 @@ func (o *consumerFileStore) Update(state *ConsumerState) error {
 	o.state.AckFloor = state.AckFloor
 	o.state.Pending = pending
 	o.state.Redelivered = redelivered
+	o.stateLoaded = true
 
 	o.kickFlusher()
 
@@ -13991,18 +14018,25 @@ func (o *consumerFileStore) ForceUpdate(state *ConsumerState) error {
 		}
 	}
 
-	// Replace our state.
+	// Serialize replacement with older captured snapshots and their writes.
+	o.wmu.Lock()
+	defer o.wmu.Unlock()
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return ErrStoreClosed
+	}
 	o.state.Delivered = state.Delivered
 	o.state.AckFloor = state.AckFloor
 	o.state.Pending = pending
 	o.state.Redelivered = redelivered
+	o.stateLoaded = true
 	buf, err := o.encodeState()
 	o.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return o.writeState(buf)
+	return o.writeStateLocked(buf)
 }
 
 // Will encrypt the state with our asset key. Will be a no-op if encryption not enabled.
@@ -14021,10 +14055,21 @@ func (o *consumerFileStore) encryptState(buf []byte) ([]byte, error) {
 	return o.aek.Seal(nonce, nonce, buf, nil), nil
 }
 
+// Raw snapshots are used only during startup cipher conversion and tests.
 func (o *consumerFileStore) writeState(buf []byte) error {
-	// Check if we have the index file open.
+	o.wmu.Lock()
+	defer o.wmu.Unlock()
+	return o.writeStateLocked(buf)
+}
+
+// The writer lock must cover capture of buf as well as its publication.
+func (o *consumerFileStore) writeStateLocked(buf []byte) error {
 	o.mu.Lock()
-	if o.writing || len(buf) == 0 {
+	if o.closed {
+		o.mu.Unlock()
+		return ErrStoreClosed
+	}
+	if len(buf) == 0 {
 		o.mu.Unlock()
 		return nil
 	}
@@ -14038,7 +14083,6 @@ func (o *consumerFileStore) writeState(buf []byte) error {
 		}
 	}
 
-	o.writing = true
 	o.dirty = false
 	ifn := o.ifn
 	o.mu.Unlock()
@@ -14050,7 +14094,6 @@ func (o *consumerFileStore) writeState(buf []byte) error {
 	if err != nil {
 		o.dirty = true
 	}
-	o.writing = false
 	o.mu.Unlock()
 
 	return err
@@ -14179,8 +14222,8 @@ func (o *consumerFileStore) stateWithCopyLocked(doCopy bool) (*ConsumerState, er
 
 	state := &ConsumerState{}
 
-	// See if we have a running state or if we need to read in from disk.
-	if o.state.Delivered.Consumer != 0 || o.state.Delivered.Stream != 0 {
+	// A successfully loaded or reset zero state is valid, not an unloaded sentinel.
+	if o.stateLoaded {
 		state.Delivered = o.state.Delivered
 		state.AckFloor = o.state.AckFloor
 		if len(o.state.Pending) > 0 {
@@ -14210,6 +14253,7 @@ func (o *consumerFileStore) stateWithCopyLocked(doCopy bool) (*ConsumerState, er
 	}
 
 	if len(buf) == 0 {
+		o.stateLoaded = true
 		return state, nil
 	}
 
@@ -14251,6 +14295,7 @@ func (o *consumerFileStore) stateWithCopyLocked(doCopy bool) (*ConsumerState, er
 		}
 	}
 
+	o.stateLoaded = true
 	return state, nil
 }
 
@@ -14261,6 +14306,7 @@ func (o *consumerFileStore) loadState() error {
 		_, err = o.stateWithCopyLocked(false)
 		return err
 	} else if os.IsNotExist(err) {
+		o.stateLoaded = true
 		return nil
 	} else {
 		return err
@@ -14381,6 +14427,8 @@ func decodeConsumerState(buf []byte) (*ConsumerState, error) {
 
 // Stop the processing of the consumers's state.
 func (o *consumerFileStore) Stop() error {
+	o.wmu.Lock()
+	defer o.wmu.Unlock()
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
@@ -14416,24 +14464,9 @@ func (o *consumerFileStore) Stop() error {
 	}
 
 	if len(buf) > 0 {
-		o.waitOnFlusher()
 		err = o.fs.writeFileWithOptionalSync(ifn, buf, defaultFilePerms)
 	}
 	return err
-}
-
-func (o *consumerFileStore) waitOnFlusher() {
-	if !o.inFlusher() {
-		return
-	}
-
-	timeout := time.Now().Add(100 * time.Millisecond)
-	for time.Now().Before(timeout) {
-		if !o.inFlusher() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 }
 
 // Delete the consumer.
@@ -14446,6 +14479,8 @@ func (o *consumerFileStore) StreamDelete() error {
 }
 
 func (o *consumerFileStore) delete(streamDeleted bool) error {
+	o.wmu.Lock()
+	defer o.wmu.Unlock()
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
